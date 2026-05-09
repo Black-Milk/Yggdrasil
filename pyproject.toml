@@ -1,7 +1,7 @@
 [project]
 name = "yggdrasil"
 version = "0.1.0"
-description = "Add your description here"
+description = "A niche library for scikit-learn compatible tree ensembles"
 readme = "README.md"
 authors = [
     { name = "black-milk", email = "edwinm87@gmail.com" }
