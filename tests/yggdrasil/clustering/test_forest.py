@@ -8,11 +8,24 @@ from sklearn.utils.estimator_checks import parametrize_with_checks
 from yggdrasil.clustering import DiscriminativeForestEmbedding
 
 
+def _expected_failed_checks(estimator):
+    reason = (
+        "Duplicating a real row also changes the empirical marginals from "
+        "which synthetic rows are drawn, so weight equivalence to row "
+        "repetition cannot hold for this estimator."
+    )
+    return {
+        "check_sample_weight_equivalence_on_dense_data": reason,
+        "check_sample_weight_equivalence_on_sparse_data": reason,
+    }
+
+
 @parametrize_with_checks(
     [
         DiscriminativeForestEmbedding(n_estimators=5, random_state=0),
         DiscriminativeForestEmbedding(n_estimators=5, backend="extra_trees", random_state=0),
-    ]
+    ],
+    expected_failed_checks=_expected_failed_checks,
 )
 def test_sklearn_compatible(estimator, check):
     check(estimator)

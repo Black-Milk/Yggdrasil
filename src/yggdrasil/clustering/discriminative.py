@@ -1,23 +1,25 @@
 """Auto-:math:`k` clustering on discriminative-forest leaf kernels.
 
 :class:`DiscriminativeForestClusterer` wraps the existing real-vs-synthetic
-:class:`~yggdrasil.clustering.DiscriminativeForestEmbedding` with an
-inspectable cluster-count selection layer and a spectral-embedding
-``k``-means label assignment. Internally it computes the leaf-kernel
+:class:`~yggdrasil.clustering.DiscriminativeForestEmbedding` with a
+multi-signal cluster-count selector and a spectral-embedding ``k``-means
+label assignment. For each reseeded forest it computes the leaf-kernel
 spectrum once via truncated SVD on the sparse leaf-indicator matrix,
-shares that spectrum between diagnostics and the embedding, optionally
-votes on ``n_clusters`` across a small number of reseeded forests, and
-falls back to ``k = 2`` rather than raising on noisy spectra.
+shares that spectrum between diagnostics and the embedding, computes
+the discriminator OOB-AUC, and (in composite mode) scores each
+candidate ``k`` via silhouette, label stability across reseeds,
+Zelnik-Manor and Perona rotation cost, and Newman modularity. The
+selector falls back to ``k = 2`` rather than raising on noisy spectra.
 
 The synthetic samples used by the discriminator forest are training
 contrast only; they are never clustered. After fitting the forest, the
-clusterer applies it back to the original real rows and operates on the
-resulting leaf embedding.
+clusterer applies it back to the original real rows and operates on
+the resulting leaf embedding.
 """
 
 from __future__ import annotations
 
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any, Literal
 
 import numpy as np
@@ -27,16 +29,20 @@ from sklearn.cluster import KMeans
 from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.utils.validation import check_is_fitted, check_random_state, validate_data
 
-from yggdrasil.clustering.diagnostics import (
-    ClusterSelectionResult,
+from yggdrasil.clustering.diagnostics.forest_quality import discriminator_oob_auc
+from yggdrasil.clustering.diagnostics.spectrum import (
     LeafSpectrum,
-    SpectralClusterCountSelector,
-    _relative_eigengaps,
     compute_leaf_spectrum,
     effective_rank,
+    eigengap_curve,
     inverse_participation_ratios,
 )
 from yggdrasil.clustering.forest import Backend, DiscriminativeForestEmbedding
+from yggdrasil.clustering.selector import (
+    CandidateInputs,
+    ClusterSelectionResult,
+    SpectralClusterCountSelector,
+)
 from yggdrasil.utils.synthetic import SamplingMethod
 
 __all__ = ["DiscriminativeForestClusterer"]
@@ -48,37 +54,43 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
     Trains an internal :class:`DiscriminativeForestEmbedding` to separate
     real samples from synthetic samples drawn from their empirical
     marginals, builds the leaf-kernel spectrum from the sparse
-    leaf-indicator matrix of the real rows, selects ``n_clusters_`` from
-    that spectrum (or accepts a user-provided integer), and assigns
-    labels by running k-means on the top eigenvectors of the kernel.
+    leaf-indicator matrix of the real rows, selects ``n_clusters_``
+    from that spectrum (or accepts a user-provided integer), and
+    assigns labels by running k-means on the top eigenvectors of the
+    kernel.
 
-    The cluster-count selector is intentionally defensive: it scores
-    relative eigengaps after optionally dropping the leading global
-    mode, takes the modal proposal across a few reseeded forests, and
-    falls back to ``k = 2`` with low confidence rather than raising
-    when the spectrum is essentially noise.
+    By default the cluster-count selector runs in composite mode: a
+    discriminator out-of-bag AUC gate fires first, then a candidate
+    set is built from per-reseed eigengaps and cumulative spectral
+    mass, intersected with effective rank, and each candidate is
+    scored by a z-scored weighted sum of silhouette, label stability,
+    Zelnik-Manor and Perona rotation cost, and Newman modularity.
+    Setting ``cluster_selection="eigengap"`` reverts to the v1
+    single-signal eigengap rule.
 
     Parameters
     ----------
     n_clusters : int or "auto", default="auto"
         Number of clusters. If ``"auto"``, ``n_clusters_`` is selected
-        from the leaf-kernel spectrum.
+        from the leaf-kernel diagnostics.
     max_clusters : int, default=20
         Largest cluster count considered when ``n_clusters="auto"``.
         Ignored when ``n_clusters`` is an explicit integer.
-    cluster_selection : {"eigengap"}, default="eigengap"
-        Cluster-count selection strategy. Only ``"eigengap"`` is
-        implemented in this version.
+    cluster_selection : {"composite", "eigengap"}, default="composite"
+        Cluster-count selection strategy. ``"composite"`` activates the
+        full multi-signal selector; ``"eigengap"`` reproduces the v1
+        single-signal eigengap rule bit-identically.
     drop_leading_mode : bool, default=True
-        If ``True``, the largest eigenvalue/eigenvector pair is excluded
-        when scoring eigengaps and when forming the spectral embedding.
-        The leading mode of a forest proximity kernel is usually a
-        global "everything connected" component that obscures cluster
-        structure.
+        If ``True``, the largest eigenvalue/eigenvector pair is
+        excluded when scoring eigengaps and when forming the spectral
+        embedding. The leading mode of a forest proximity kernel is
+        usually a global "everything connected" component that
+        obscures cluster structure.
     n_selection_resamples : int, default=3
         Number of forests fit during ``n_clusters="auto"`` selection,
-        each with a different seed; the modal proposed ``k`` is chosen.
-        Ignored when ``n_clusters`` is an explicit integer.
+        each with a different seed. The composite selector uses these
+        for label-stability scoring; the eigengap selector uses them
+        for modal-:math:`k` voting.
     n_estimators : int, default=100
         Number of trees in each fitted forest.
     backend : {"random_forest", "extra_trees"}, default="random_forest"
@@ -86,9 +98,38 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         :class:`DiscriminativeForestEmbedding`.
     synthetic_method : {"bootstrap", "permutation", "uniform"}, default="bootstrap"
         Synthetic-sampling method used by the discriminator forest.
+    min_discriminator_auc : float, default=0.55
+        Composite-mode AUC gate. When the mean discriminator OOB-AUC
+        across reseeds is below this threshold the selector returns
+        ``n_clusters_=2`` with ``confidence="low"`` and
+        ``gating_reason="discriminator_auc_below_threshold"``.
+        Ignored when ``cluster_selection="eigengap"``.
+    cumulative_mass_threshold : float, default=0.9
+        Threshold for the cumulative-spectral-mass candidate.
+    silhouette_weight : float, default=1.0
+        Composite weight on the silhouette signal.
+    stability_weight : float, default=1.0
+        Composite weight on the label-stability signal.
+    rotation_weight : float, default=1.0
+        Composite weight on the (negated) rotation-cost signal.
+    modularity_weight : float, default=0.0
+        Composite weight on Newman modularity. Off by default because
+        modularity requires materializing dense ``O(n_samples^2)``
+        kernels.
+    localization_threshold : float or None, default=None
+        Optional inverse-participation-ratio cutoff used to drop
+        candidate ``k`` whose top-:math:`k` eigenvectors are too
+        concentrated on a few samples.
+    confidence_margin : float, default=0.5
+        Composite-score margin (in z-score units) required between the
+        winner and runner-up for ``confidence="high"``.
+    stability_floor : float, default=0.6
+        Minimum mean ARI across reseeds at the winning ``k`` required
+        for ``confidence="high"``.
     random_state : int, RandomState instance or None, default=None
         Controls all randomness: synthetic-sample generation, forest
-        seeds, the SVD initialization, and the final k-means.
+        seeds, the SVD initialization, the rotation-cost optimizer,
+        and the per-(k, reseed) k-means runs.
         See :term:`Glossary <random_state>`.
 
     Attributes
@@ -96,19 +137,19 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
     labels_ : ndarray of shape (n_samples,)
         Cluster index assigned to each training sample.
     n_clusters_ : int
-        Number of clusters used for the final assignment. Equals
-        ``n_clusters`` when an integer was provided; otherwise the
-        eigengap-selected count.
+        Number of clusters used for the final assignment.
     spectral_embedding_ : ndarray of shape (n_samples, n_components)
         Row-normalized matrix of top eigenvectors used as the input to
         k-means. ``n_components <= n_clusters_`` (one less when
         ``drop_leading_mode=True`` and the leading mode was excluded).
     forest_embedding_ : DiscriminativeForestEmbedding
-        The fitted underlying embedding. Useful for inspecting the
-        forest, the synthetic data, and the leaf assignments.
+        The fitted underlying embedding for the primary reseed.
     cluster_selection_ : ClusterSelectionResult
-        Structured summary of how ``n_clusters_`` was chosen, including
-        eigenvalues, eigengaps, effective rank, and per-seed proposals.
+        Structured summary of how ``n_clusters_`` was chosen,
+        including eigenvalues, eigengaps, effective rank, per-seed
+        proposals, and (in composite mode) per-:math:`k` silhouette,
+        stability, rotation cost, modularity, composite scores, and
+        the discriminator OOB-AUC.
     random_state_ : RandomState
         The random number generator instantiated from ``random_state``.
     n_features_in_ : int
@@ -120,13 +161,14 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
     Notes
     -----
     The spectrum used for both selection and label assignment is
-    computed once via truncated SVD on the sparse leaf-indicator matrix;
-    the dense :math:`n \\times n` kernel is never materialized.
+    computed once via truncated SVD on the sparse leaf-indicator
+    matrix; the dense :math:`n \\times n` kernel is never materialized
+    unless ``modularity_weight > 0``.
 
-    Kernel ``k``-means against the precomputed leaf kernel is documented
-    as an alternative in
-    ``docs/random_forest_leaf_kernel_recipes.md`` but is not provided as
-    a backend in this version.
+    Kernel ``k``-means against the precomputed leaf kernel is
+    documented as an alternative in
+    ``docs/random_forest_leaf_kernel_recipes.md`` but is not provided
+    as a backend in this version.
 
     Examples
     --------
@@ -151,12 +193,21 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
     _parameter_constraints: dict[str, list[Any]] = {
         "n_clusters": [Integral, StrOptions({"auto"})],
         "max_clusters": [Interval(Integral, 2, None, closed="left")],
-        "cluster_selection": [StrOptions({"eigengap"})],
+        "cluster_selection": [StrOptions({"eigengap", "composite"})],
         "drop_leading_mode": ["boolean"],
         "n_selection_resamples": [Interval(Integral, 1, None, closed="left")],
         "n_estimators": [Interval(Integral, 1, None, closed="left")],
         "backend": [StrOptions({"random_forest", "extra_trees"})],
         "synthetic_method": [StrOptions({"bootstrap", "permutation", "uniform"})],
+        "min_discriminator_auc": [Interval(Real, 0.0, 1.0, closed="both")],
+        "cumulative_mass_threshold": [Interval(Real, 0.0, 1.0, closed="right")],
+        "silhouette_weight": [Interval(Real, 0.0, None, closed="left")],
+        "stability_weight": [Interval(Real, 0.0, None, closed="left")],
+        "rotation_weight": [Interval(Real, 0.0, None, closed="left")],
+        "modularity_weight": [Interval(Real, 0.0, None, closed="left")],
+        "localization_threshold": [Interval(Real, 0.0, 1.0, closed="both"), None],
+        "confidence_margin": [Interval(Real, 0.0, None, closed="left")],
+        "stability_floor": [Interval(Real, -1.0, 1.0, closed="both")],
         "random_state": ["random_state"],
     }
 
@@ -165,12 +216,21 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         n_clusters: int | Literal["auto"] = "auto",
         *,
         max_clusters: int = 20,
-        cluster_selection: Literal["eigengap"] = "eigengap",
+        cluster_selection: Literal["eigengap", "composite"] = "composite",
         drop_leading_mode: bool = True,
         n_selection_resamples: int = 3,
         n_estimators: int = 100,
         backend: Backend = "random_forest",
         synthetic_method: SamplingMethod = "bootstrap",
+        min_discriminator_auc: float = 0.55,
+        cumulative_mass_threshold: float = 0.9,
+        silhouette_weight: float = 1.0,
+        stability_weight: float = 1.0,
+        rotation_weight: float = 1.0,
+        modularity_weight: float = 0.0,
+        localization_threshold: float | None = None,
+        confidence_margin: float = 0.5,
+        stability_floor: float = 0.6,
         random_state: int | np.random.RandomState | None = None,
     ) -> None:
         self.n_clusters = n_clusters
@@ -181,6 +241,15 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         self.n_estimators = n_estimators
         self.backend = backend
         self.synthetic_method = synthetic_method
+        self.min_discriminator_auc = min_discriminator_auc
+        self.cumulative_mass_threshold = cumulative_mass_threshold
+        self.silhouette_weight = silhouette_weight
+        self.stability_weight = stability_weight
+        self.rotation_weight = rotation_weight
+        self.modularity_weight = modularity_weight
+        self.localization_threshold = localization_threshold
+        self.confidence_margin = confidence_margin
+        self.stability_floor = stability_floor
         self.random_state = random_state
 
     def __sklearn_tags__(self):
@@ -215,44 +284,95 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         target_k = self._target_k(n_samples)
         n_components = self._n_components_for(target_k, n_samples)
 
-        primary_spectrum = self._fit_primary_spectrum(X, n_components)
+        primary_spectrum, primary_embedding, primary_y_disc = self._fit_primary_spectrum(
+            X, n_components
+        )
+        self.forest_embedding_ = primary_embedding
+        primary_auc = self._safe_oob_auc(primary_embedding, primary_y_disc)
 
         if self.n_clusters == "auto":
-            spectra = [primary_spectrum]
+            spectra: list[LeafSpectrum] = [primary_spectrum]
+            extra_aucs: list[float] = []
             for _ in range(self.n_selection_resamples - 1):
-                Z_extra, n_extra = self._fit_extra_embedding(X)
-                spectrum_extra = compute_leaf_spectrum(
-                    Z_extra,
-                    n_components=min(n_components, *Z_extra.shape),
-                    n_estimators=n_extra,
-                    random_state=self.random_state_,
-                )
+                spectrum_extra, auc_extra = self._fit_extra_spectrum(X, n_components)
                 spectra.append(spectrum_extra)
+                if auc_extra is not None:
+                    extra_aucs.append(auc_extra)
+
+            auc_values = [primary_auc, *extra_aucs] if primary_auc is not None else extra_aucs
+            mean_auc = float(np.mean(auc_values)) if auc_values else None
 
             selector = SpectralClusterCountSelector(
                 max_clusters=self.max_clusters,
                 drop_leading_mode=self.drop_leading_mode,
                 strategy=self.cluster_selection,
+                min_discriminator_auc=self.min_discriminator_auc,
+                cumulative_mass_threshold=self.cumulative_mass_threshold,
+                silhouette_weight=self.silhouette_weight,
+                stability_weight=self.stability_weight,
+                rotation_weight=self.rotation_weight,
+                modularity_weight=self.modularity_weight,
+                localization_threshold=self.localization_threshold,
+                confidence_margin=self.confidence_margin,
+                stability_floor=self.stability_floor,
             )
-            self.cluster_selection_ = selector.select(spectra)
+
+            candidate_inputs: CandidateInputs | None = None
+            embeddings_per_k_per_seed: dict[int, list[np.ndarray]] = {}
+            labelings_per_k_per_seed: dict[int, list[np.ndarray]] = {}
+            if self.cluster_selection == "composite":
+                candidates = selector.candidate_set(spectra)
+                kernels = self._maybe_build_kernels(spectra) if candidates else None
+                for k in candidates:
+                    embeddings_per_k_per_seed[k] = []
+                    labelings_per_k_per_seed[k] = []
+                    for spectrum in spectra:
+                        embedding = self._build_spectral_embedding(spectrum, k)
+                        labels = self._kmeans_labels(embedding, k)
+                        embeddings_per_k_per_seed[k].append(embedding)
+                        labelings_per_k_per_seed[k].append(labels)
+                candidate_inputs = CandidateInputs(
+                    labelings=labelings_per_k_per_seed,
+                    embeddings=embeddings_per_k_per_seed,
+                    kernels=kernels,
+                )
+
+            self.cluster_selection_ = selector.select(
+                spectra,
+                candidate_inputs=candidate_inputs,
+                discriminator_auc=mean_auc,
+            )
             self.n_clusters_ = int(self.cluster_selection_.n_clusters)
+
+            cached_embedding = (
+                embeddings_per_k_per_seed.get(self.n_clusters_, [None])[0]
+                if self.cluster_selection == "composite"
+                else None
+            )
+            cached_labels = (
+                labelings_per_k_per_seed.get(self.n_clusters_, [None])[0]
+                if self.cluster_selection == "composite"
+                else None
+            )
         else:
             self.n_clusters_ = int(self.n_clusters)
             self.cluster_selection_ = self._explicit_selection_result(
+                primary_spectrum, self.n_clusters_, primary_auc
+            )
+            cached_embedding = None
+            cached_labels = None
+
+        if cached_embedding is not None:
+            self.spectral_embedding_ = cached_embedding
+        else:
+            self.spectral_embedding_ = self._build_spectral_embedding(
                 primary_spectrum, self.n_clusters_
             )
 
-        self.spectral_embedding_ = self._build_spectral_embedding(
-            primary_spectrum, self.n_clusters_
-        )
-
-        kmeans_seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
-        kmeans = KMeans(
-            n_clusters=self.n_clusters_,
-            n_init=10,
-            random_state=kmeans_seed,
-        )
-        self.labels_ = kmeans.fit_predict(self.spectral_embedding_)
+        if cached_labels is not None:
+            self.labels_ = cached_labels.astype(np.int64, copy=True)
+        else:
+            self.labels_ = self._kmeans_labels(self.spectral_embedding_, self.n_clusters_)
         return self
 
     def fit_predict(
@@ -290,42 +410,58 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         n_components = min(n_components, max(n_samples - 1, 1))
         return max(n_components, 2)
 
-    def _fit_primary_spectrum(
-        self,
-        X: np.ndarray | sp.spmatrix,
-        n_components: int,
-    ) -> LeafSpectrum:
-        forest_seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
-        embedding = DiscriminativeForestEmbedding(
+    def _make_embedding(self, seed: int) -> DiscriminativeForestEmbedding:
+        return DiscriminativeForestEmbedding(
             n_estimators=self.n_estimators,
             backend=self.backend,
             synthetic_method=self.synthetic_method,
             sparse_output=True,
-            random_state=forest_seed,
+            oob_score=True,
+            random_state=seed,
         )
+
+    def _fit_primary_spectrum(
+        self,
+        X: np.ndarray | sp.spmatrix,
+        n_components: int,
+    ) -> tuple[LeafSpectrum, DiscriminativeForestEmbedding, np.ndarray]:
+        seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
+        embedding = self._make_embedding(seed)
         Z = embedding.fit_transform(X)
-        self.forest_embedding_ = embedding
-        return compute_leaf_spectrum(
+        spectrum = compute_leaf_spectrum(
             Z,
             n_components=min(n_components, *Z.shape),
             n_estimators=self.n_estimators,
             random_state=self.random_state_,
         )
+        return spectrum, embedding, embedding.y_disc_
 
-    def _fit_extra_embedding(
+    def _fit_extra_spectrum(
         self,
         X: np.ndarray | sp.spmatrix,
-    ) -> tuple[sp.spmatrix, int]:
+        n_components: int,
+    ) -> tuple[LeafSpectrum, float | None]:
         seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
-        embedding = DiscriminativeForestEmbedding(
-            n_estimators=self.n_estimators,
-            backend=self.backend,
-            synthetic_method=self.synthetic_method,
-            sparse_output=True,
-            random_state=seed,
-        )
+        embedding = self._make_embedding(seed)
         Z = embedding.fit_transform(X)
-        return Z, self.n_estimators
+        spectrum = compute_leaf_spectrum(
+            Z,
+            n_components=min(n_components, *Z.shape),
+            n_estimators=self.n_estimators,
+            random_state=self.random_state_,
+        )
+        auc = self._safe_oob_auc(embedding, embedding.y_disc_)
+        return spectrum, auc
+
+    def _safe_oob_auc(
+        self,
+        embedding: DiscriminativeForestEmbedding,
+        y_disc: np.ndarray,
+    ) -> float | None:
+        try:
+            return float(discriminator_oob_auc(embedding.forest_, y_disc))
+        except AttributeError, ValueError:
+            return None
 
     def _build_spectral_embedding(
         self,
@@ -344,19 +480,43 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         safe_norms = np.where(norms > 0, norms, 1.0)
         return U / safe_norms
 
+    def _kmeans_labels(self, embedding: np.ndarray, n_clusters: int) -> np.ndarray:
+        kmeans_seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
+        kmeans = KMeans(
+            n_clusters=n_clusters,
+            n_init=10,
+            random_state=kmeans_seed,
+        )
+        labels = kmeans.fit_predict(embedding)
+        return labels.astype(np.int64, copy=False)
+
+    def _maybe_build_kernels(
+        self,
+        spectra: list[LeafSpectrum],
+    ) -> list[np.ndarray] | None:
+        """Materialize the dense kernel for each reseed if modularity is on."""
+        if self.modularity_weight <= 0.0:
+            return None
+        kernels: list[np.ndarray] = []
+        for spectrum in spectra:
+            U = spectrum.eigenvectors
+            kernels.append(U @ np.diag(spectrum.eigenvalues) @ U.T)
+        return kernels
+
     def _explicit_selection_result(
         self,
         spectrum: LeafSpectrum,
         n_clusters: int,
+        discriminator_auc: float | None,
     ) -> ClusterSelectionResult:
-        eigengaps = _relative_eigengaps(spectrum.eigenvalues)
         return ClusterSelectionResult(
             n_clusters=n_clusters,
             eigenvalues=spectrum.eigenvalues.copy(),
-            eigengaps=eigengaps,
+            eigengaps=eigengap_curve(spectrum.eigenvalues),
             effective_rank=effective_rank(spectrum.eigenvalues),
             localization=inverse_participation_ratios(spectrum.eigenvectors),
             proposed_k_per_seed=np.array([n_clusters], dtype=np.int64),
             strategy="explicit",
             confidence="high",
+            discriminator_auc=discriminator_auc,
         )

@@ -467,6 +467,86 @@ A few practical cautions that apply to all three surfaces:
   voting across reseeded forests, and seed-stability checks before
   trusting a particular $k$. See sections 6 and 7.
 
+### Step 8 in detail: composite cluster-count selection (v2)
+
+The cluster-count selector that ships with
+[`yggdrasil.clustering.SpectralClusterCountSelector`](../src/yggdrasil/clustering/selector.py)
+runs in one of two strategies:
+
+- `strategy="eigengap"` reproduces the v1 single-signal rule
+  bit-identically: relative eigengaps over the (optionally
+  leading-mode-trimmed) spectrum propose $k$, modal-$k$ voting across
+  reseeded forests confirms it, and the result falls back to $k = 2$
+  when no clear gap is present.
+- `strategy="composite"` (the v2 default) instead combines several
+  diagnostics into a single z-scored weighted sum.
+
+Composite scoring proceeds in three layers:
+
+1. **Discriminator gate.** The selector first checks the mean
+   out-of-bag AUC of the real-vs-synthetic forest across reseeds via
+   [`discriminator_oob_auc`](../src/yggdrasil/clustering/diagnostics/forest_quality.py).
+   When the AUC is below `min_discriminator_auc` (default $0.55$),
+   clustering is treated as unjustified: the result is $k = 2$ with
+   `confidence="low"` and
+   `gating_reason="discriminator_auc_below_threshold"`.
+
+2. **Candidate-set construction.** For each reseeded spectrum, the
+   top three eigengap candidates are unioned with the
+   cumulative-spectral-mass candidate produced by
+   [`cumulative_spectral_mass`](../src/yggdrasil/clustering/diagnostics/spectrum.py).
+   The union is intersected with $\bigl[2,\,\min(\text{max\_clusters},\,\lceil
+   \overline{r_{\mathrm{eff}}}\rceil)\bigr]$ where $\overline{r_{\mathrm{eff}}}$
+   is the mean effective rank across reseeds. Optionally the
+   `localization_threshold` parameter drops candidate $k$ whose top-$k$
+   eigenvectors of the primary spectrum have inverse-participation
+   ratio above that threshold (i.e. modes concentrated on a few rows;
+   see section 7).
+
+3. **Per-candidate scoring.** For each candidate $k$ and each reseeded
+   spectrum, the clusterer builds the row-normalized spectral
+   embedding and runs k-means to produce a labeling. The selector
+   then computes:
+   - **silhouette** in the spectral embedding via
+     [`silhouette_on_embedding`](../src/yggdrasil/clustering/diagnostics/partition.py),
+   - **label stability** as mean pairwise ARI across reseeds via
+     [`label_stability`](../src/yggdrasil/clustering/diagnostics/stability.py),
+   - **rotation cost** via the Zelnik-Manor and Perona alignment
+     procedure
+     [`rotation_cost`](../src/yggdrasil/clustering/diagnostics/rotation.py).
+     The raw alignment cost $J(R)/n$ lives in $[1, k]$; the
+     implementation rescales it to $(J(R)/n - 1) / (k - 1) \in [0, 1]$
+     so different $k$ are directly comparable,
+   - and (optionally, `modularity_weight > 0`)
+     **Newman modularity** on the leaf kernel via
+     [`modularity_on_kernel`](../src/yggdrasil/clustering/diagnostics/partition.py).
+
+   Each signal is z-score normalized across the candidate set and the
+   composite score is
+
+   $$
+   \mathrm{score}(k) =
+       w_{\mathrm{sil}}\,z_{\mathrm{sil}}(k)
+     + w_{\mathrm{stab}}\,z_{\mathrm{stab}}(k)
+     - w_{\mathrm{rot}}\,z_{\mathrm{rot}}(k)
+     + w_{\mathrm{mod}}\,z_{\mathrm{mod}}(k).
+   $$
+
+   Rotation cost is negated because lower is better. The default
+   weights are $1$ except `modularity_weight = 0` (off because
+   modularity needs a dense $n \times n$ kernel).
+
+The winner is the argmax of the composite. Confidence is `"high"`
+when the winner clears the runner-up by at least `confidence_margin`
+(default $0.5$ z-units) and the winner's mean ARI is at least
+`stability_floor` (default $0.6$); `"medium"` when only the second
+condition holds; otherwise `"low"` and the result falls back to
+$k = 2$.
+
+Each individual diagnostic is independently importable from
+`yggdrasil.clustering.diagnostics` and can be applied to non-Yggdrasil
+embeddings, kernels, or labelings.
+
 ## 12. Hierarchical Clustering Recipe
 
 The proximity kernel can also produce hierarchical clusters.

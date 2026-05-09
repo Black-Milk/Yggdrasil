@@ -36,9 +36,9 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.utils import check_random_state
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import _check_sample_weight, check_is_fitted, validate_data
 
-from yggdrasil.utils.synthetic import SamplingMethod, generate_discriminative_dataset
+from yggdrasil.utils.synthetic import SamplingMethod, generate_synthetic_features
 
 __all__ = ["DiscriminativeForestEmbedding"]
 
@@ -89,6 +89,13 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
         that :class:`~sklearn.ensemble.ExtraTreesClassifier` defaults to
         ``False`` upstream; this estimator defaults to ``True`` for both
         backends so they are directly comparable.
+    oob_score : bool, default=False
+        If ``True``, the underlying forest computes an out-of-bag
+        decision function during :meth:`fit`, exposed as
+        ``forest_.oob_decision_function_``. This is required by
+        :func:`yggdrasil.clustering.diagnostics.discriminator_oob_auc`,
+        which the discriminative-forest clusterer uses as a kernel
+        informativeness gate. Requires ``bootstrap=True``.
     sparse_output : bool, default=True
         If ``True``, :meth:`transform` returns a sparse one-hot encoding of
         the leaves; otherwise it returns the raw leaf-index matrix of shape
@@ -118,6 +125,11 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
     one_hot_encoder_ : OneHotEncoder
         Encoder used to one-hot encode leaf indices when
         ``sparse_output=True``.
+    y_disc_ : ndarray of shape (2 * n_samples,)
+        Binary real-vs-synthetic targets used to fit ``forest_``, in
+        the same row order as ``forest_.oob_decision_function_``.
+        Real samples are labeled ``1`` and synthetic samples ``0``.
+        Useful for computing OOB metrics on the discriminator.
     random_state_ : RandomState
         The random number generator instantiated from ``random_state``.
     n_features_in_ : int
@@ -157,6 +169,7 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
         max_features: str | int | float | None = "sqrt",
         max_leaf_nodes: int | None = None,
         bootstrap: bool = True,
+        oob_score: bool = False,
         sparse_output: bool = True,
         synthetic_method: SamplingMethod = "bootstrap",
         n_jobs: int | None = None,
@@ -174,12 +187,18 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
         self.max_features = max_features
         self.max_leaf_nodes = max_leaf_nodes
         self.bootstrap = bootstrap
+        self.oob_score = oob_score
         self.sparse_output = sparse_output
         self.synthetic_method = synthetic_method
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.verbose = verbose
         self.warm_start = warm_start
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.sparse = True
+        return tags
 
     def _make_forest(self, random_state: int | np.random.RandomState | None) -> Any:
         """Instantiate the configured backend forest classifier."""
@@ -199,6 +218,7 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
             max_features=self.max_features,
             max_leaf_nodes=self.max_leaf_nodes,
             bootstrap=self.bootstrap,
+            oob_score=self.oob_score,
             n_jobs=self.n_jobs,
             random_state=random_state,
             verbose=self.verbose,
@@ -219,10 +239,11 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
             Training data.
         y : Ignored
             Present for API consistency with supervised estimators.
-        sample_weight : array-like of shape (2 * n_samples,), default=None
-            Sample weights for the discriminator forest. The length matches
-            the doubled real-plus-synthetic dataset; pass ``None`` to use
-            uniform weights.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Sample weights for the real rows of ``X``. Synthetic rows are
+            always given uniform weight ``1.0`` because they describe a
+            fixed empirical-marginal contrast that is not under user
+            control. Pass ``None`` to use uniform weights everywhere.
 
         Returns
         -------
@@ -246,8 +267,9 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
             Training data.
         y : Ignored
             Present for API consistency with supervised estimators.
-        sample_weight : array-like of shape (2 * n_samples,), default=None
-            Sample weights for the discriminator forest.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Sample weights for the real rows of ``X``. Synthetic rows
+            are weighted at ``1.0``; see :meth:`fit` for the rationale.
 
         Returns
         -------
@@ -265,18 +287,45 @@ class DiscriminativeForestEmbedding(TransformerMixin, BaseEstimator):
             X_dense = X
 
         self.random_state_ = check_random_state(self.random_state)
-        X_disc, y_disc = generate_discriminative_dataset(
+        n_samples = X_dense.shape[0]
+
+        synth_X = generate_synthetic_features(
             X_dense, method=self.synthetic_method, random_state=self.random_state_
         )
+        X_disc = np.vstack((X_dense, synth_X))
+        y_disc = np.concatenate((np.ones(n_samples), np.zeros(n_samples)))
+
+        if sample_weight is not None:
+            sample_weight = _check_sample_weight(sample_weight, X_dense)
+            sw_disc = np.concatenate((sample_weight, np.ones(n_samples, dtype=sample_weight.dtype)))
+        else:
+            sw_disc = None
+
+        # Permute real and synthetic rows together so the discriminator does
+        # not see them in separate contiguous blocks; the same permutation is
+        # applied to ``y_disc`` (and ``sw_disc`` when present) to keep them
+        # aligned with one another and with ``forest_.oob_decision_function_``.
+        perm = self.random_state_.permutation(2 * n_samples)
+        X_disc = X_disc[perm]
+        y_disc = y_disc[perm]
+        if sw_disc is not None:
+            sw_disc = sw_disc[perm]
 
         forest_seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
         self.forest_ = self._make_forest(random_state=forest_seed)
-        self.forest_.fit(X_disc, y_disc, sample_weight=sample_weight)
+        self.forest_.fit(X_disc, y_disc, sample_weight=sw_disc)
+        self.y_disc_ = y_disc
 
         leaves = self.forest_.apply(X)
         if self.sparse_output:
+            # Fit the encoder on the leaves visited by the *training* data
+            # (real + synthetic), so every leaf the trained forest can return
+            # is a known category at transform time. Fitting only on
+            # ``apply(X)`` would miss leaves visited only by synthetic rows
+            # and reject held-out real samples that later land in them.
             self.one_hot_encoder_ = OneHotEncoder(sparse_output=True)
-            return self.one_hot_encoder_.fit_transform(leaves)
+            self.one_hot_encoder_.fit(self.forest_.apply(X_disc))
+            return self.one_hot_encoder_.transform(leaves)
         return leaves
 
     def transform(self, X: np.ndarray | sp.spmatrix) -> np.ndarray | sp.spmatrix:

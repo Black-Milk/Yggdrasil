@@ -5,12 +5,12 @@ from sklearn.datasets import make_blobs
 from sklearn.utils._testing import assert_allclose
 
 from yggdrasil.clustering import DiscriminativeForestEmbedding
-from yggdrasil.clustering.diagnostics import (
-    ClusterSelectionResult,
+from yggdrasil.clustering.diagnostics.spectrum import (
     LeafSpectrum,
-    SpectralClusterCountSelector,
     compute_leaf_spectrum,
+    cumulative_spectral_mass,
     effective_rank,
+    eigengap_curve,
     inverse_participation_ratios,
 )
 from yggdrasil.clustering.kernel import leaf_indicator_matrix, leaf_kernel
@@ -92,49 +92,39 @@ def test_inverse_participation_ratios_rejects_non_2d():
         inverse_participation_ratios(np.array([1.0, 0.0, 0.0]))
 
 
-def test_selector_picks_three_clusters_on_three_blobs():
-    X, _ = make_blobs(n_samples=120, centers=3, n_features=4, cluster_std=0.5, random_state=0)
-    spectra = []
-    for seed in range(3):
-        embedding = DiscriminativeForestEmbedding(
-            n_estimators=50, sparse_output=True, random_state=seed
-        ).fit(X)
-        Z = embedding.transform(X)
-        spectra.append(
-            compute_leaf_spectrum(
-                Z, n_components=15, n_estimators=embedding.n_estimators, random_state=seed
-            )
-        )
+def test_cumulative_spectral_mass_picks_smallest_k_at_threshold():
+    eigs = np.array([4.0, 1.0, 1.0])
 
-    selector = SpectralClusterCountSelector()
-    result = selector.select(spectra)
-
-    assert isinstance(result, ClusterSelectionResult)
-    assert result.n_clusters == 3
-    assert result.confidence == "high"
-    assert result.proposed_k_per_seed.shape == (3,)
+    assert cumulative_spectral_mass(eigs, threshold=0.5) == 1
+    assert cumulative_spectral_mass(eigs, threshold=0.7) == 2
+    assert cumulative_spectral_mass(eigs, threshold=0.95) == 3
 
 
-def test_selector_falls_back_to_two_with_low_confidence_on_single_blob():
-    X, _ = make_blobs(n_samples=120, centers=1, n_features=4, cluster_std=1.0, random_state=0)
-    spectra = []
-    for seed in range(3):
-        embedding = DiscriminativeForestEmbedding(
-            n_estimators=50, sparse_output=True, random_state=seed
-        ).fit(X)
-        Z = embedding.transform(X)
-        spectra.append(
-            compute_leaf_spectrum(
-                Z, n_components=15, n_estimators=embedding.n_estimators, random_state=seed
-            )
-        )
-
-    result = SpectralClusterCountSelector().select(spectra)
-
-    assert result.n_clusters == 2
-    assert result.confidence == "low"
+def test_cumulative_spectral_mass_rejects_invalid_threshold():
+    with pytest.raises(ValueError, match="threshold"):
+        cumulative_spectral_mass(np.array([1.0, 1.0]), threshold=0.0)
+    with pytest.raises(ValueError, match="threshold"):
+        cumulative_spectral_mass(np.array([1.0, 1.0]), threshold=1.5)
 
 
-def test_selector_rejects_empty_spectra_list():
-    with pytest.raises(ValueError, match="at least one"):
-        SpectralClusterCountSelector().select([])
+def test_cumulative_spectral_mass_accepts_leaf_spectrum_object(three_blob_embedding):
+    _, Z, n_estimators = three_blob_embedding
+    spectrum = compute_leaf_spectrum(Z, n_components=10, n_estimators=n_estimators, random_state=0)
+
+    k = cumulative_spectral_mass(spectrum, threshold=0.9)
+
+    assert 1 <= k <= spectrum.eigenvalues.size
+
+
+def test_eigengap_curve_returns_n_minus_one_relative_gaps():
+    eigs = np.array([4.0, 1.0, 0.5])
+
+    gaps = eigengap_curve(eigs)
+
+    assert gaps.shape == (2,)
+    assert gaps[0] == pytest.approx(3.0, rel=1e-6)
+    assert gaps[1] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_eigengap_curve_returns_empty_for_single_eigenvalue():
+    assert eigengap_curve(np.array([1.0])).shape == (0,)
