@@ -21,6 +21,7 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.14.0",
+    "seaborn>=0.13.2",
 ]
 
 [tool.ruff]
@@ -41,6 +42,7 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "src/yggdrasil/*" = ["N803", "N806", "RUF012"]
 "tests/*" = ["N803", "N806"]
+"experiments/*" = ["N803", "N806"]
 
 [tool.ruff.format]
 docstring-code-format = true

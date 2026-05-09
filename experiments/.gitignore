@@ -1,0 +1,9 @@
+# Generated artifacts
+**/plots/
+**/*.png
+**/*.pdf
+**/*.svg
+
+# Cache from pandas/seaborn or scratch experimentation
+**/__pycache__/
+*.csv.tmp
