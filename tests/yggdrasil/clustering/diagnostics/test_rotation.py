@@ -58,3 +58,24 @@ def test_rotation_cost_deterministic_under_fixed_random_state():
 def test_rotation_cost_rejects_non_2d_input():
     with pytest.raises(ValueError, match="2-D"):
         rotation_cost(np.zeros(5))
+
+
+def test_rotation_cost_rejects_zero_restarts():
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(10, 3))
+
+    with pytest.raises(ValueError, match="n_restarts"):
+        rotation_cost(X, n_restarts=0)
+
+
+def test_rotation_cost_more_restarts_never_increase_cost():
+    """Restarts add basins to consider, so the best alignment cost is monotonic."""
+    rng = np.random.default_rng(0)
+    indicator = np.repeat(np.eye(5, dtype=np.float64), 6, axis=0)
+    rotated = indicator @ np.linalg.qr(rng.normal(size=(5, 5)))[0]
+    rotated += rng.normal(scale=0.05, size=rotated.shape)
+
+    one_shot = rotation_cost(rotated, n_restarts=1, random_state=0)
+    many = rotation_cost(rotated, n_restarts=10, random_state=0)
+
+    assert many <= one_shot + 1e-9

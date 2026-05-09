@@ -38,6 +38,7 @@ from yggdrasil.clustering.diagnostics.spectrum import (
     inverse_participation_ratios,
 )
 from yggdrasil.clustering.forest import Backend, DiscriminativeForestEmbedding
+from yggdrasil.clustering.kernel import leaf_kernel
 from yggdrasil.clustering.selector import (
     CandidateInputs,
     ClusterSelectionResult,
@@ -284,18 +285,23 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         target_k = self._target_k(n_samples)
         n_components = self._n_components_for(target_k, n_samples)
 
-        primary_spectrum, primary_embedding, primary_y_disc = self._fit_primary_spectrum(
-            X, n_components
+        keep_z = self.modularity_weight > 0.0
+        primary_spectrum, primary_embedding, primary_y_disc, primary_Z = self._fit_primary_spectrum(
+            X, n_components, keep_z=keep_z
         )
         self.forest_embedding_ = primary_embedding
         primary_auc = self._safe_oob_auc(primary_embedding, primary_y_disc)
 
         if self.n_clusters == "auto":
             spectra: list[LeafSpectrum] = [primary_spectrum]
+            cached_zs: list[sp.csr_matrix | None] = [primary_Z]
             extra_aucs: list[float] = []
             for _ in range(self.n_selection_resamples - 1):
-                spectrum_extra, auc_extra = self._fit_extra_spectrum(X, n_components)
+                spectrum_extra, auc_extra, Z_extra = self._fit_extra_spectrum(
+                    X, n_components, keep_z=keep_z
+                )
                 spectra.append(spectrum_extra)
+                cached_zs.append(Z_extra)
                 if auc_extra is not None:
                     extra_aucs.append(auc_extra)
 
@@ -322,7 +328,7 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
             labelings_per_k_per_seed: dict[int, list[np.ndarray]] = {}
             if self.cluster_selection == "composite":
                 candidates = selector.candidate_set(spectra)
-                kernels = self._maybe_build_kernels(spectra) if candidates else None
+                kernels = self._maybe_build_kernels(cached_zs) if candidates else None
                 for k in candidates:
                     embeddings_per_k_per_seed[k] = []
                     labelings_per_k_per_seed[k] = []
@@ -424,7 +430,14 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
         self,
         X: np.ndarray | sp.spmatrix,
         n_components: int,
-    ) -> tuple[LeafSpectrum, DiscriminativeForestEmbedding, np.ndarray]:
+        *,
+        keep_z: bool,
+    ) -> tuple[
+        LeafSpectrum,
+        DiscriminativeForestEmbedding,
+        np.ndarray,
+        sp.csr_matrix | None,
+    ]:
         seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
         embedding = self._make_embedding(seed)
         Z = embedding.fit_transform(X)
@@ -434,13 +447,16 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
             n_estimators=self.n_estimators,
             random_state=self.random_state_,
         )
-        return spectrum, embedding, embedding.y_disc_
+        cached_Z = sp.csr_matrix(Z) if keep_z else None
+        return spectrum, embedding, embedding.y_disc_, cached_Z
 
     def _fit_extra_spectrum(
         self,
         X: np.ndarray | sp.spmatrix,
         n_components: int,
-    ) -> tuple[LeafSpectrum, float | None]:
+        *,
+        keep_z: bool,
+    ) -> tuple[LeafSpectrum, float | None, sp.csr_matrix | None]:
         seed = int(self.random_state_.randint(np.iinfo(np.int32).max))
         embedding = self._make_embedding(seed)
         Z = embedding.fit_transform(X)
@@ -451,7 +467,8 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
             random_state=self.random_state_,
         )
         auc = self._safe_oob_auc(embedding, embedding.y_disc_)
-        return spectrum, auc
+        cached_Z = sp.csr_matrix(Z) if keep_z else None
+        return spectrum, auc, cached_Z
 
     def _safe_oob_auc(
         self,
@@ -492,15 +509,25 @@ class DiscriminativeForestClusterer(ClusterMixin, BaseEstimator):
 
     def _maybe_build_kernels(
         self,
-        spectra: list[LeafSpectrum],
+        cached_zs: list[sp.csr_matrix | None],
     ) -> list[np.ndarray] | None:
-        """Materialize the dense kernel for each reseed if modularity is on."""
+        """Materialize the exact dense kernel for each reseed if modularity is on.
+
+        Computes ``K = leaf_kernel(Z, n_estimators)`` rather than the
+        truncated SVD reconstruction ``U Λ Uᵀ``. The truncated form
+        underestimates trace and degree, can have negative entries, and
+        biases :func:`modularity_on_kernel`; the exact form is
+        non-negative, has unit diagonal, and matches what the rest of
+        the leaf-kernel toolbox documents in
+        ``docs/random_forest_leaf_kernel_recipes.md``.
+        """
         if self.modularity_weight <= 0.0:
             return None
         kernels: list[np.ndarray] = []
-        for spectrum in spectra:
-            U = spectrum.eigenvectors
-            kernels.append(U @ np.diag(spectrum.eigenvalues) @ U.T)
+        for Z in cached_zs:
+            if Z is None:
+                continue
+            kernels.append(leaf_kernel(Z, n_estimators=self.n_estimators))
         return kernels
 
     def _explicit_selection_result(

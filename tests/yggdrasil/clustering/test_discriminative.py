@@ -163,7 +163,14 @@ def test_modularity_weight_enables_kernel_path(three_blobs):
         random_state=0,
     ).fit(X)
 
-    assert len(est.cluster_selection_.modularity_per_k) >= 1
+    modularity = est.cluster_selection_.modularity_per_k
+    assert len(modularity) >= 1
+    assert all(np.isfinite(v) for v in modularity.values())
+    # Newman modularity on a clustered proximity kernel must be strictly
+    # positive at the winning k. The previous truncated `U Λ Uᵀ`
+    # reconstruction routinely violated this (negative off-diagonals,
+    # under-counted degrees); leaf_kernel(Z) restores it.
+    assert modularity[est.n_clusters_] > 0.0
 
 
 def test_fit_is_deterministic_under_fixed_random_state(three_blobs):

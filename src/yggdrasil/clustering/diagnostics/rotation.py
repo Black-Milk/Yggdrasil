@@ -84,6 +84,7 @@ def _alignment_cost(theta: np.ndarray, X: np.ndarray) -> float:
 def rotation_cost(
     top_eigvecs: np.ndarray,
     *,
+    n_restarts: int = 5,
     max_iter: int = 200,
     tol: float = 1e-6,
     random_state: int | np.random.RandomState | None = None,
@@ -92,25 +93,31 @@ def rotation_cost(
 
     Row-normalizes the input, parameterizes a rotation ``R \\in SO(k)``
     by ``k(k-1)/2`` Givens angles, and minimizes the alignment cost
-    via L-BFGS-B starting from a small random perturbation of the
-    identity. The raw alignment cost ``J(R)/n`` lives in ``[1, k]``
-    (the lower bound is hit when every row is a perfect 1-hot, the
-    upper bound when rows are uniform); this function returns the
-    rescaled value ``(J(R)/n - 1) / (k - 1)`` so different ``k`` are
-    on the same ``[0, 1]`` axis. Lower is better.
+    via L-BFGS-B with multiple random restarts. The raw alignment cost
+    ``J(R)/n`` lives in ``[1, k]`` (the lower bound is hit when every
+    row is a perfect 1-hot, the upper bound when rows are uniform);
+    this function returns the rescaled value
+    ``(J(R)/n - 1) / (k - 1)`` so different ``k`` are on the same
+    ``[0, 1]`` axis. Lower is better.
 
     Parameters
     ----------
     top_eigvecs : ndarray of shape (n_samples, k)
         Leading eigenvectors of the leaf kernel, with ``k`` equal to
         the candidate cluster count under evaluation.
+    n_restarts : int, default=5
+        Number of L-BFGS-B restarts from independent random
+        initializations. The best (lowest) alignment cost is returned.
+        The first restart starts near the identity rotation; the
+        remaining ones sample angles broadly to break out of local
+        minima. Set to ``1`` to recover the cheapest single-shot
+        behavior.
     max_iter : int, default=200
-        Maximum L-BFGS-B iterations.
+        Maximum L-BFGS-B iterations per restart.
     tol : float, default=1e-6
         Gradient-norm tolerance for L-BFGS-B convergence.
     random_state : int, RandomState instance or None, default=None
-        Controls the random initial perturbation used to break the
-        identity-initialization symmetry. See
+        Controls the random initializations. See
         :term:`Glossary <random_state>`.
 
     Returns
@@ -124,12 +131,13 @@ def rotation_cost(
     Notes
     -----
     The optimization is local; the alignment cost is non-convex in the
-    Givens angles. In practice the local minimum reached from a small
-    perturbation around the identity is sufficient to discriminate
-    between candidate ``k`` values, which is what the selector relies
-    on. For diagnostic use on a single ``k``, callers may want to
-    invoke this several times with different ``random_state`` values
-    and take the minimum.
+    Givens angles. The signed-permutation symmetry of ``SO(k)`` means
+    every clean clustering corresponds to ``2^k k!`` equivalent global
+    minima, plus genuinely worse local minima from spurious
+    near-uniform rows. Restarts with broad initial angles are the
+    standard countermeasure (Zelnik-Manor and Perona, 2004). For
+    well-clustered data a single restart usually suffices; the default
+    of ``5`` is cheap insurance for noisy spectra and large ``k``.
 
     Examples
     --------
@@ -144,6 +152,8 @@ def rotation_cost(
         raise ValueError(
             f"top_eigvecs must be a 2-D array of shape (n_samples, k); got shape {X.shape}."
         )
+    if int(n_restarts) < 1:
+        raise ValueError(f"n_restarts must be at least 1; got {n_restarts}.")
     _, k = X.shape
     if k < 2:
         return 0.0
@@ -151,15 +161,23 @@ def rotation_cost(
     X_norm = _row_normalize(X)
     n_angles = k * (k - 1) // 2
     rs = check_random_state(random_state)
-    theta0 = rs.normal(scale=0.01, size=n_angles)
+    options = {"maxiter": int(max_iter), "gtol": float(tol)}
 
-    result = minimize(
-        _alignment_cost,
-        theta0,
-        args=(X_norm,),
-        method="L-BFGS-B",
-        options={"maxiter": int(max_iter), "gtol": float(tol)},
-    )
-    raw = float(result.fun)
-    rescaled = (raw - 1.0) / max(k - 1, 1)
+    best = float("inf")
+    for restart in range(int(n_restarts)):
+        if restart == 0:
+            theta0 = rs.normal(scale=0.01, size=n_angles)
+        else:
+            theta0 = rs.uniform(low=-np.pi, high=np.pi, size=n_angles)
+        result = minimize(
+            _alignment_cost,
+            theta0,
+            args=(X_norm,),
+            method="L-BFGS-B",
+            options=options,
+        )
+        if float(result.fun) < best:
+            best = float(result.fun)
+
+    rescaled = (best - 1.0) / max(k - 1, 1)
     return float(np.clip(rescaled, 0.0, 1.0))
